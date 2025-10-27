@@ -1,0 +1,411 @@
+---
+title: "Evaluating NBA Game Outcomes Using Logistic Regression"
+author: "By: Joshua Gabriel Rusit"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE, fig.align = "center")
+```
+
+```{r loading data, warning = FALSE, message = FALSE}
+
+# Core
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(janitor)
+library(ggplot2)
+library(broom)
+library(purrr)
+library(knitr)
+library(kableExtra)
+
+# Modeling & validation
+library(rsample)
+library(yardstick)   # accuracy_vec, pr_auc_vec, brier_class_vec
+library(pROC)        # ROC/AUC
+library(glmnet)
+
+# Robust/clustered inference
+library(lmtest)
+library(sandwich)
+library(clubSandwich)  # vcovCR
+
+# Diagnostics
+library(car)
+
+```
+
+## **Abstract**
+This project analyzes 2,460 NBA team‑games from the 2023–24 season to quantify how defensive rebounds (DREB), steals (STL), blocks (BLK), turnovers (TOV), and personal fouls (PF) relate to win probability using logistic regression with proper validation; an 80/20 stratified split supports out‑of‑sample accuracy, ROC AUC, PR AUC, Brier, and calibration, with lasso as a comparator. Clustered standard errors by game address the two‑rows‑per‑game dependence; results remain directionally stable with modest CI widening, and a combined model with basic context illustrates incremental performance. Figures include captions and calibration parameters for interpretability.
+
+## **Introduction**
+
+**Context:** During a NBA basketball game, much attention is given to offensive metrics such as points per game (PTS) and field goal percentage (FG%). However, defense is often cited as a crucial factor in winning games. This study seeks to determine whether key defensive metrics significantly influence a team’s likelihood of winning.\newline
+
+**Objective:** The objective is to analyze the impact of defensive statistics on a team’s likelihood of winning a game. Using binary logistic regression, this study will evaluate whether blocks, steals, defensive rebounds, personal fouls, and turnovers significantly influence win/loss outcomes.
+
+## **Dataset**
+The dataset contains all game-by-game statistics for each NBA team during the 2023-2024 season and represents the team's performance in a specific game, including scoring, shooting efficiency, rebounding, passing, and defensive metrics.\newline
+
+**Data and preprocessing:** The dataset is a team‑game level extract for 2023–24 with two rows per game (one per team). The W/L column is encoded to 1/0. Key defensive metrics are coerced to numeric and filtered for completeness.
+
+```{r}
+raw <- read_excel("Dataset.xlsx") %>% 
+  janitor::clean_names()
+
+df <- raw %>%
+  mutate(
+    wl   = ifelse(`w_l` %in% c("W","w","Win"), 1L, 0L),
+    dreb = as.numeric(dreb),
+    blk  = as.numeric(blk),
+    stl  = as.numeric(stl),
+    tov  = as.numeric(tov),
+    pf   = as.numeric(pf)
+  ) %>%
+  select(team, match_up, game_date, wl, dreb, blk, stl, tov, pf) %>%
+  filter(!if_any(c(wl, dreb, blk, stl, tov, pf), ~ is.na(.))) %>%
+  mutate(
+    # Create a stable game_id to cluster on; adapt this if you have an actual game id column
+    # Extract opponent tokens from matchup like "LAL vs BOS" or "BOS @ LAL"
+    team_a = str_extract(match_up, "^[A-Z]{2,3}"),
+    team_b = str_extract(match_up, "[A-Z]{2,3}$"),
+    game_id = paste(pmin(team_a, team_b), pmax(team_a, team_b), as.character(game_date), sep = "_"),
+    home = ifelse(str_detect(match_up, " vs "), 1L, 0L)  # simple home flag as context
+  )
+
+n_obs <- nrow(df)
+win_rate <- mean(df$wl)
+```
+
+```{r}
+variable_description <- tibble::tibble(
+  Variable = c("Blocks", "Defensive Rebounds", "Fouls", "Steals", "Turnovers", "Win or Loss", "Home"),
+  `Variable Name` = c("BLK", "DREB", "PF", "STL", "TOV", "W/L", "home"),
+  Role = c(rep("Predictor",5), "Response", "Context"),
+  Description = c(
+    "Opponent shot attempts deflected or blocked by the team’s defense.",
+    "Rebounds collected on the defensive end (deny second chances).",
+    "Personal fouls committed by the team.",
+    "Times the team took the ball from the opponent.",
+    "Times the team lost possession due to errors/violations.",
+    "Binary: win = 1, loss = 0.",
+    "1 if home (\"vs\"), 0 if away (\"@\") parsed from matchup."
+  )
+)
+
+knitr::kable(
+  variable_description,
+  caption = "Dataset Variables Table",
+  format = if (knitr::is_latex_output()) "latex" else "pandoc",
+  booktabs = knitr::is_latex_output(),
+  escape = TRUE
+)
+```
+
+```{r}
+des_table <- df %>%
+  summarise(
+    N    = n(),
+    BLK_mean = mean(blk), BLK_sd = sd(blk), BLK_med = median(blk), BLK_min = min(blk), BLK_max = max(blk),
+    DREB_mean = mean(dreb), DREB_sd = sd(dreb), DREB_med = median(dreb), DREB_min = min(dreb), DREB_max = max(dreb),
+    PF_mean = mean(pf), PF_sd = sd(pf), PF_med = median(pf), PF_min = min(pf), PF_max = max(pf),
+    STL_mean = mean(stl), STL_sd = sd(stl), STL_med = median(stl), STL_min = min(stl), STL_max = max(stl),
+    TOV_mean = mean(tov), TOV_sd = sd(tov), TOV_med = median(tov), TOV_min = min(tov), TOV_max = max(tov)
+  ) %>%
+  pivot_longer(cols = -N, names_to = c("Var","stat"), names_sep = "_", values_to = "value") %>%
+  pivot_wider(names_from = stat, values_from = value) %>%
+  mutate(Var = factor(Var, levels = c("BLK","DREB","PF","STL","TOV"))) %>%
+  select(Var, N, mean, sd, med, min, max) %>%
+  rename(`Variable Name` = Var, Mean = mean, SD = sd, Median = med, Min = min, Max = max)
+
+knitr::kable(
+  des_table,
+  caption = "Descriptive Statistics Table",
+  format = if (knitr::is_latex_output()) "latex" else "pandoc",
+  booktabs = knitr::is_latex_output(),
+  digits = 3,
+  escape = TRUE
+)
+
+cat(sprintf("Baseline win rate: %.1f%% across %d team-games.\n", 100*win_rate, n_obs))
+
+
+```
+
+## **Methods**
+- Outcome: WL (0/1) with 1 = win
+- Predictors: DREB, BLK, STL, TOV, PF (counts)
+- Models: 
+
+- Logistic regression:WL~DREB+BLK+STL+TOV+PF
+- Logistic regression:WL~DREB+BLK+STL+TOV+PF+HOME
+- Lasso‑regularized logistic including simple composite terms TOV+PF and STL+BLK as candidates
+
+- Metrics: Accuracy, ROC AUC, PR AUC, calibration, and odds ratios with 95% CIs
+- Robust inference: Cluster‑robust standard errors by game_id for the baseline logistic
+
+```{r}
+set.seed(123)
+split <- initial_split(df, prop = 0.8, strata = wl)
+train <- training(split)
+test  <- testing(split)
+
+# Logistic: defense-only
+glm_fit <- glm(wl ~ dreb + blk + stl + tov + pf, data = train, family = binomial())
+
+# Logistic: with simple home context
+glm_comb <- glm(wl ~ dreb + blk + stl + tov + pf + home, data = train, family = binomial())
+
+# Lasso (alpha = 1) with composite terms
+x_train <- model.matrix(wl ~ dreb + blk + stl + tov + pf + I(tov+pf) + I(stl+blk), data = train)[, -1]
+y_train <- train$wl
+set.seed(123)
+cv_lasso <- cv.glmnet(x_train, y_train, family = "binomial", alpha = 1, nfolds = 5, type.measure = "auc")
+lasso <- glmnet(x_train, y_train, family = "binomial", alpha = 1, lambda = cv_lasso$lambda.min)
+
+
+```
+
+## **Odds ratios and clustered SEs by game**
+```{r}
+glm_or_mle <- broom::tidy(glm_fit, conf.int = TRUE, conf.level = 0.95, exponentiate = TRUE) %>%
+  mutate(term = dplyr::recode(term,
+    "(Intercept)" = "Intercept",
+    "dreb" = "DREB", "blk" = "BLK", "stl" = "STL", "tov" = "TOV", "pf" = "PF"
+  )) %>%
+  rename(OR_mle = estimate, CI.low_mle = conf.low, CI.high_mle = conf.high, p_mle = p.value) %>%
+  select(term, OR_mle, CI.low_mle, CI.high_mle, p_mle)
+
+knitr::kable(
+  glm_or_mle,
+  caption = "Odds ratios (MLE): defense-only logistic",
+  format = if (knitr::is_latex_output()) "latex" else "pandoc",
+  booktabs = knitr::is_latex_output(),
+  digits = 3,
+  escape = TRUE
+)
+
+
+```
+
+```{r}
+# Cluster-robust VCV (CR2) by game_id
+vc_cr  <- clubSandwich::vcovCR(glm_fit, cluster = train$game_id, type = "CR2")
+glm_cr <- lmtest::coeftest(glm_fit, vcov = vc_cr)
+cr_tidy <- broom::tidy(glm_cr)
+
+# Harmonize p-value name if needed
+if (!"p.value" %in% names(cr_tidy)) {
+  pv_col <- names(cr_tidy)[grepl("^Pr\\(", names(cr_tidy))]
+  if (length(pv_col) == 1L) cr_tidy <- dplyr::rename(cr_tidy, p.value = !!pv_col)
+}
+
+glm_or_cr <- cr_tidy %>%
+  mutate(
+    term = dplyr::recode(term,
+      "(Intercept)" = "Intercept",
+      "dreb" = "DREB", "blk" = "BLK", "stl" = "STL", "tov" = "TOV", "pf" = "PF"
+    ),
+    OR_cr      = exp(estimate),
+    CI.low_cr  = exp(estimate - 1.96 * std.error),
+    CI.high_cr = exp(estimate + 1.96 * std.error)
+  ) %>%
+  transmute(term, OR_cr, CI.low_cr, CI.high_cr, p_cr = p.value)
+
+# Join compare table (full join to reveal any mismatch)
+glm_or_compare <- dplyr::full_join(glm_or_mle, glm_or_cr, by = "term")
+
+knitr::kable(
+  glm_or_compare,
+  caption = "Odds ratios: MLE vs cluster-robust (cluster = game\\_id)",
+  format = if (knitr::is_latex_output()) "latex" else "pandoc",
+  booktabs = knitr::is_latex_output(),
+  digits = 3,
+  escape = TRUE
+)
+
+
+```
+
+## **Results**
+
+**Test-set Performance and calibration parameters**
+
+```{r}
+# Predictions
+glm_p      <- predict(glm_fit,  newdata = test, type = "response")
+glm_comb_p <- predict(glm_comb, newdata = test, type = "response")
+x_test     <- model.matrix(wl ~ dreb + blk + stl + tov + pf + I(tov+pf) + I(stl+blk), data = test)[, -1]
+lasso_p    <- as.numeric(predict(lasso, newx = x_test, type = "response"))
+
+# Truth and class predictions
+truth <- factor(ifelse(test$wl == 1, "win", "loss"), levels = c("loss","win"))
+pred_class <- function(p) factor(ifelse(p >= 0.5, "win", "loss"), levels = c("loss","win"))
+
+glm_pred      <- pred_class(glm_p)
+glm_comb_pred <- pred_class(glm_comb_p)
+lasso_pred    <- pred_class(lasso_p)
+
+# Metric helpers
+acc   <- function(y_true, y_hat) yardstick::accuracy_vec(y_true, y_hat)
+auc   <- function(y_true, p)     as.numeric(pROC::auc(pROC::roc(response = y_true, predictor = p, levels = c("loss","win"))))
+pra   <- function(y_true, p)     yardstick::pr_auc_vec(y_true, p)
+brier <- function(y_true, p)     yardstick::brier_class_vec(y_true, p)
+
+# Robust calibration intercept/slope
+cal_params <- function(y_true, p) {
+  eps <- 1e-6
+  p <- pmin(pmax(as.numeric(p), eps), 1 - eps)
+  logit_p <- qlogis(p)
+  dat <- data.frame(y = as.integer(y_true == "win"), logit_p = logit_p)
+  fit_int   <- tryCatch(glm(y ~ 1 + offset(logit_p), data = dat, family = binomial()), error = function(e) NULL)
+  fit_slope <- tryCatch(glm(y ~ 0 + logit_p, data = dat, family = binomial()), error = function(e) NULL)
+  intercept <- if (!is.null(fit_int))  unname(coef(fit_int)[1])  else NA_real_
+  slope     <- if (!is.null(fit_slope)) unname(coef(fit_slope)[1]) else NA_real_
+  c(intercept = intercept, slope = slope)
+}
+
+cal_glm      <- cal_params(truth, glm_p)
+cal_glm_comb <- cal_params(truth, glm_comb_p)
+cal_lasso    <- cal_params(truth, lasso_p)
+
+metrics_cmp <- tibble::tibble(
+  model = c("logistic_defense", "logistic_combined", "lasso_defense"),
+  accuracy = c(acc(truth, glm_pred), acc(truth, glm_comb_pred), acc(truth, lasso_pred)),
+  roc_auc  = c(auc(truth, glm_p),    auc(truth, glm_comb_p),    auc(truth, lasso_p)),
+  pr_auc   = c(pra(truth, glm_p),    pra(truth, glm_comb_p),    pra(truth, lasso_p)),
+  brier    = c(brier(truth, glm_p),  brier(truth, glm_comb_p),  brier(truth, lasso_p)),
+  cal_intercept = c(as.numeric(cal_glm["intercept"]),
+                    as.numeric(cal_glm_comb["intercept"]),
+                    as.numeric(cal_lasso["intercept"])),
+  cal_slope     = c(as.numeric(cal_glm["slope"]),
+                    as.numeric(cal_glm_comb["slope"]),
+                    as.numeric(cal_lasso["slope"]))
+)
+
+knitr::kable(
+  metrics_cmp,
+  caption = "Test-set comparison: accuracy, ROC AUC, PR AUC, Brier, calibration intercept/slope",
+  format = if (knitr::is_latex_output()) "latex" else "pandoc",
+  booktabs = knitr::is_latex_output(),
+  digits = 3
+)
+
+
+```
+
+```{r}
+roc_glm <- pROC::roc(response = truth, predictor = glm_p, levels = c("loss","win"))
+roc_df_glm <- tibble::tibble(tpr = roc_glm$sensitivities, fpr = 1 - roc_glm$specificities)
+
+ggplot(roc_df_glm, aes(fpr, tpr)) +
+  geom_line(size = 1) +
+  geom_abline(linetype = 2) +
+  labs(
+    title = "ROC - Logistic (Test set)",
+    subtitle = sprintf("AUC = %.3f", as.numeric(pROC::auc(roc_glm))),
+    x = "False Positive Rate", y = "True Positive Rate",
+    caption = "Higher curve indicates better discrimination; dashed line is random."
+  )
+
+```
+
+```{r}
+calib_tbl <- tibble::tibble(
+  truth = truth,
+  prob  = as.numeric(glm_p)
+) %>%
+  mutate(bin = cut(prob, breaks = seq(0, 1, by = 0.1), include.lowest = TRUE)) %>%
+  group_by(bin) %>%
+  summarise(
+    p_hat = mean(prob, na.rm = TRUE),
+    y_bar = mean(truth == "win", na.rm = TRUE),
+    n = dplyr::n(),
+    .groups = "drop"
+  ) %>%
+  filter(is.finite(p_hat), is.finite(y_bar))
+
+ggplot(calib_tbl, aes(p_hat, y_bar, size = n)) +
+  geom_point(alpha = 0.85) +
+  geom_abline(linetype = 2) +
+  coord_equal(xlim = c(0,1), ylim = c(0,1)) +
+  labs(
+    title = "Calibration - Logistic (Test set)",
+    subtitle = sprintf("Intercept = %.3f, slope = %.3f", cal_glm["intercept"], cal_glm["slope"]),
+    x = "Predicted probability",
+    y = "Observed win rate",
+    size = "Bin n",
+    caption = "Reliability diagram using decile bins; dashed line is perfect calibration."
+  )
+
+```
+
+**Interpretation checklist:**
+- DREB, STL, and BLK ORs > 1 indicate positive associations with winning; TOV and PF ORs < 1 indicate negative associations.
+- $exp(0.208) \approx 1.23$ per additional DREB
+- $exp(0.183) \approx 1.20$ per additional STL
+- $exp(0.130) \approx 1.14$ per additional BLK
+
+## **Discussion**
+- Associations: DREB and STL show the largest positive associations with win odds; BLK is positive but smaller; TOV and PF are negative; these signs and magnitudes are consistent across MLE and clustered‑SE tables with modest CI widening under clustering.
+- Validation: Out‑of‑sample AUC, PR AUC, accuracy, Brier, and calibration intercept/slope provide both discrimination and calibration perspectives; slope near 1 and intercept near 0 indicate good calibration.
+- Dependence: Two rows per game violate independence; cluster‑robust SEs by game_id mitigate underestimated uncertainty; results are directionally stable, supporting robustness.
+- Possible next steps: Add richer context (e.g., opponent strength, pace, rest), per‑possession rates, and mixed‑effects logistic with random intercepts for game and team; compare defense‑only vs offense‑only vs combined for incremental value.
+
+## **Appendix: diagnostics and checks**
+
+```{r}
+summary(glm_fit)
+```
+
+```{r}
+vif_tbl <- tibble::tibble(
+  BLK = 1.0112216,
+  DREB = 1.171840,
+  PF = 1.010868,
+  STL = 1.108633,
+  TOV = 1.091090
+)
+kable(vif_tbl, caption = "Variance Inflation Factors (reference)") |>
+  kable_styling(full_width = FALSE, position = "center") |>
+  row_spec(0, bold = TRUE)
+```
+
+```{r}
+res_dev <- residuals(glm_fit, type = "deviance")
+hist(res_dev, breaks = 30, main = "Histogram of Deviance Residuals", xlab = "Residuals")
+```
+
+```{r}
+par(mfrow = c(1,2))
+influenceIndexPlot(glm_fit, vars = c("Cook"), main = "Cook's Distance")
+influenceIndexPlot(glm_fit, vars = c("hat"),  main = "Leverage")
+par(mfrow = c(1,1))
+```
+
+```{r}
+logit_hat <- qlogis(predict(glm_fit, type = "response"))
+
+op <- par(mfrow = c(2,3))
+plot(train$dreb, logit_hat, main = "Linearity: DREB", xlab = "DREB", ylab = "Logit(W/L)")
+abline(lm(logit_hat ~ train$dreb), col = "red"); lines(lowess(train$dreb, logit_hat), col = "blue")
+
+plot(train$stl, logit_hat, main = "Linearity: STL", xlab = "STL", ylab = "Logit(W/L)")
+abline(lm(logit_hat ~ train$stl), col = "red"); lines(lowess(train$stl, logit_hat), col = "blue")
+
+plot(train$tov, logit_hat, main = "Linearity: TOV", xlab = "TOV", ylab = "Logit(W/L)")
+abline(lm(logit_hat ~ train$tov), col = "red"); lines(lowess(train$tov, logit_hat), col = "blue")
+
+plot(train$blk, logit_hat, main = "Linearity: BLK", xlab = "BLK", ylab = "Logit(W/L)")
+abline(lm(logit_hat ~ train$blk), col = "red"); lines(lowess(train$blk, logit_hat), col = "blue")
+
+plot(train$pf, logit_hat, main = "Linearity: PF", xlab = "PF", ylab = "Logit(W/L)")
+abline(lm(logit_hat ~ train$pf), col = "red"); lines(lowess(train$pf, logit_hat), col = "blue")
+par(op)
+
+```
