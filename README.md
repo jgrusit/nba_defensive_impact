@@ -1,4 +1,4 @@
-# NBA Defensive Impact
+# NBA Defensive Impact Project
 
 Overview:
 
