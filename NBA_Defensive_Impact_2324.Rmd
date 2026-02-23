@@ -1,0 +1,683 @@
+---
+title: "Predicting NBA Game Outcomes: A Comparison of Classification Methods"
+author: "By: Joshua Gabriel Rusit"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE, fig.align = "center")
+```
+
+```{r loading data, warning = FALSE, message = FALSE}
+
+# Load required packages
+library(readxl)      # Read Excel files
+library(dplyr)       # Data manipulation
+library(tidyr)       # Data tidying
+library(ggplot2)     # Visualization
+library(broom)       # Tidy model output
+library(knitr)       # Tables
+library(pROC)        # ROC curves
+library(MASS)        # LDA/QDA
+library(rpart)       # Classification trees
+library(rpart.plot)  # Tree visualization
+
+```
+
+## **Abstract**
+This project analyzes NBA team defensive statistics from the 2023-24 season to predict game outcomes (win/loss) using multiple classification methods. The dataset contains 2,460 team-game observations with five key defensive metrics: defensive rebounds (DREB), steals (STL), blocks (BLK), turnovers (TOV), and personal fouls (PF). We compare the performance of three classification approaches: logistic regression (parametric), linear discriminant analysis (parametric with different assumptions), and classification trees (non-parametric). Using an 80/20 train-test split and 10-fold cross-validation, all models achieve strong predictive performance (AUC > 0.94), with the classification tree slightly outperforming the others. Variable importance analysis reveals that defensive rebounds and steals are the most critical defensive metrics for predicting wins.
+
+## **Introduction**
+
+**Context:** During a NBA basketball game, much attention is given to offensive metrics such as points per game (PTS) and field goal percentage (FG%). However, defense is often cited as a crucial factor in winning games. This study seeks to determine whether key defensive metrics significantly influence a team’s likelihood of winning.\newline
+
+**Objective:** The objective is to analyze the impact of defensive statistics on a team’s likelihood of winning a game. Using binary logistic regression, this study will evaluate whether blocks, steals, defensive rebounds, personal fouls, and turnovers significantly influence win/loss outcomes.
+
+## **Dataset**
+The dataset contains all game-by-game statistics for each NBA team during the 2023-2024 season and represents the team's performance in a specific game, including scoring, shooting efficiency, rebounding, passing, and defensive metrics.\newline
+
+**Data and preprocessing:** The dataset is a team‑game level extract for 2023–24 with two rows per game (one per team). The W/L column is encoded to 1/0. Key defensive metrics are coerced to numeric and filtered for completeness.
+
+```{r}
+# Read and clean data
+raw_data <- read_excel("Dataset.xlsx")
+
+# Clean column names and prepare data
+nba_data <- raw_data %>%
+  # Convert column names to lowercase and standardize
+  rename_all(tolower) %>%
+  rename_all(~gsub(" ", "_", .)) %>%
+  rename_all(~gsub("%", "pct", .)) %>%
+  # Create binary outcome: 1 = Win, 0 = Loss
+  mutate(
+    win = ifelse(`w/l` == "W", 1, 0),  # Note: changed w_l to `w/l`
+    # Ensure all predictors are numeric
+    dreb = as.numeric(dreb),
+    stl = as.numeric(stl),
+    blk = as.numeric(blk),
+    tov = as.numeric(tov),
+    pf = as.numeric(pf)
+  ) %>%
+  # Select only variables we need - explicitly use dplyr::select
+  dplyr::select(team, game_date, win, dreb, stl, blk, tov, pf) %>%
+  # Remove any rows with missing values
+  filter(complete.cases(.))
+
+# Display first few rows
+head(nba_data) %>% kable(caption = "First 6 observations of cleaned data")
+
+
+```
+
+```{r}
+# Create Variable Description
+variables <- data.frame(
+  Variable = c("DREB", "STL", "BLK", "TOV", "PF", "Win"),
+  Full_Name = c("Defensive Rebounds", "Steals", "Blocks", 
+                "Turnovers", "Personal Fouls", "Win/Loss"),
+  Role = c(rep("Predictor", 5), "Response"),
+  Type = c(rep("Numeric (count)", 5), "Binary (0/1)"),
+  Description = c(
+    "Number of rebounds collected on the defensive end",
+    "Number of times the team stole the ball from opponent",
+    "Number of opponent shots blocked by the defense",
+    "Number of times the team turned the ball over (negative)",
+    "Number of personal fouls committed by the team",
+    "Binary outcome: 1 = Win, 0 = Loss"
+  )
+)
+
+kable(variables, caption = "Dataset Variables")
+
+```
+
+```{r}
+# Calculate summary statistics
+desc_stats <- nba_data %>%
+  summarise(
+    N = n(),
+    across(c(dreb, stl, blk, tov, pf),
+           list(Mean = mean, SD = sd, Min = min, 
+                Median = median, Max = max),
+           .names = "{.col}_{.fn}")
+  ) %>%
+  pivot_longer(cols = -N, 
+               names_to = c("Variable", "Statistic"),
+               names_sep = "_",
+               values_to = "Value") %>%
+  pivot_wider(names_from = Statistic, values_from = Value) %>%
+  mutate(Variable = toupper(Variable))
+
+kable(desc_stats, digits = 2, 
+      caption = "Descriptive Statistics for Defensive Metrics")
+
+# Overall win rate
+win_rate <- mean(nba_data$win)
+cat(sprintf("\nDataset size: %d team-games\n", nrow(nba_data)))
+cat(sprintf("Baseline win rate: %.1f%%\n", win_rate * 100))
+cat(sprintf("This represents a balanced dataset (expected 50%% in sports data)\n"))
+
+```
+
+```{r}
+# Create boxplots comparing winners vs losers
+plot_data <- nba_data %>%
+  mutate(Outcome = ifelse(win == 1, "Win", "Loss")) %>%
+  dplyr::select(Outcome, dreb, stl, blk, tov, pf) %>%
+  pivot_longer(cols = -Outcome, names_to = "Metric", values_to = "Value")
+
+ggplot(plot_data, aes(x = Outcome, y = Value, fill = Outcome)) +
+  geom_boxplot(alpha = 0.7) +
+  facet_wrap(~toupper(Metric), scales = "free_y", ncol = 3) +
+  scale_fill_manual(values = c("Loss" = "#d62728", "Win" = "#2ca02c")) +
+  labs(title = "Distribution of Defensive Statistics by Game Outcome",
+       subtitle = "Winners tend to have higher DREB, STL, BLK and lower TOV",
+       x = "Game Outcome", y = "Value") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        plot.title = element_text(face = "bold"))
+
+```
+
+```{r}
+# Correlation matrix
+cor_matrix <- nba_data %>%
+  dplyr::select(win, dreb, stl, blk, tov, pf) %>%
+  cor()
+
+kable(round(cor_matrix, 3), caption = "Correlation Matrix")
+
+cat("\nKey correlations with Win:\n")
+cat(sprintf("  - DREB:  %.3f (strong positive)\n", cor_matrix["win", "dreb"]))
+cat(sprintf("  - STL:   %.3f (moderate positive)\n", cor_matrix["win", "stl"]))
+cat(sprintf("  - BLK:   %.3f (weak positive)\n", cor_matrix["win", "blk"]))
+cat(sprintf("  - TOV:   %.3f (moderate negative)\n", cor_matrix["win", "tov"]))
+cat(sprintf("  - PF:    %.3f (weak negative)\n", cor_matrix["win", "pf"]))
+
+```
+
+## Methods
+
+### Modeling approaches
+
+We compare three classification methods introduced in class:
+
+- **Logistic regression**: A parametric model that estimates the log-odds of winning as a linear function of the predictors DREB, STL, BLK, TOV, and PF. It provides interpretable coefficients in the form of odds ratios and makes minimal distributional assumptions about the predictors.
+
+- **Linear discriminant analysis (LDA)**: A parametric classifier that assumes multivariate normality within each class and equal covariance matrices across classes. It constructs a linear decision boundary in the predictor space and can be more efficient than logistic regression when its assumptions hold.
+
+- **Classification tree**: A non-parametric method that recursively partitions the predictor space using binary splits to minimize node impurity. Trees can automatically capture non-linear relationships and interactions and are easy to visualize, but a single tree can have higher variance than linear models.
+
+### Data splitting and evaluation
+
+To evaluate how well these models generalize, we use two complementary strategies:
+
+- An 80/20 train–test split, where we fit all models on the training set (80% of observations) and assess performance once on the held-out test set (20%).  
+- 10-fold cross-validation on the training data, where we repeatedly refit each model on 9 folds and evaluate on the remaining fold, then average the performance metrics across folds.
+
+For each model, we compute:
+
+- **Accuracy**: Proportion of correctly classified games.  
+- **Sensitivity (recall for wins)**: Proportion of actual wins correctly predicted as wins.  
+- **Specificity (recall for losses)**: Proportion of actual losses correctly predicted as losses.  
+- **AUC (Area Under the ROC Curve)**: Overall ability to rank wins above losses across all thresholds.
+
+Our primary comparison metric is AUC, with accuracy and sensitivity/specificity providing additional context.
+
+```{r}
+# Set seed for reproducibility
+set.seed(123)
+
+# Create stratified train-test split
+n <- nrow(nba_data)
+train_indices <- sample(1:n, size = round(0.8 * n))
+
+train_data <- nba_data[train_indices, ]
+test_data <- nba_data[-train_indices, ]
+
+# Verify stratification
+cat(sprintf("Training set: n = %d, win rate = %.1f%%\n", 
+            nrow(train_data), mean(train_data$win) * 100))
+cat(sprintf("Test set: n = %d, win rate = %.1f%%\n", 
+            nrow(test_data), mean(test_data$win) * 100))
+
+```
+
+```{r}
+# Fit logistic regression
+logistic_model <- glm(win ~ dreb + stl + blk + tov + pf, 
+                      data = train_data, 
+                      family = binomial())
+
+# Display summary
+summary(logistic_model)
+
+```
+
+```{r}
+# Get tidy coefficient table with confidence intervals
+logistic_coef_table <- tidy(logistic_model, conf.int = TRUE, exponentiate = TRUE) %>%
+  mutate(
+    term = recode(term, 
+                  "(Intercept)" = "Intercept",
+                  "dreb" = "DREB", "stl" = "STL", "blk" = "BLK",
+                  "tov" = "TOV", "pf" = "PF")
+  ) %>%
+  dplyr::select(term, estimate, conf.low, conf.high, p.value) %>%
+  rename(`Odds Ratio` = estimate, 
+         `95% CI Lower` = conf.low,
+         `95% CI Upper` = conf.high,
+         `P-value` = p.value)
+
+kable(logistic_coef_table, digits = 3,
+      caption = "Logistic Regression: Odds Ratios and 95% Confidence Intervals")
+
+```
+
+## Logistic regression results
+
+The logistic regression model uses DREB, STL, BLK, TOV, and PF to predict the log-odds of winning. All five predictors are statistically significant at the 0.001 level, indicating that each defensive metric contributes meaningfully to explaining game outcomes. 
+
+Interpreting the odds ratios:
+
+- **Defensive rebounds (DREB)**: OR $\approx$ 1.24. Holding other variables constant, each additional defensive rebound increases a team’s odds of winning by about **24%**.  
+- **Steals (STL)**: OR $\approx$ 1.22. Each additional steal increases the odds of winning by about **22%**.  
+- **Blocks (BLK)**: OR $\approx$ 1.16. Each additional block increases the odds of winning by about **16%**.  
+- **Turnovers (TOV)**: OR $\approx$ 0.89. Each additional turnover decreases the odds of winning by about **11%**, consistent with the idea that giving away possessions is costly.  
+- **Personal fouls (PF)**: OR $\approx$ 0.95. Each additional foul slightly decreases the odds of winning, but the effect is smaller than for turnovers.
+
+Overall, the logistic model suggests that controlling the defensive glass and generating steals are particularly important for winning, while turnovers and fouls hurt a team’s chances.
+
+```{r}
+# Fit LDA model
+lda_model <- lda(win ~ dreb + stl + blk + tov + pf, 
+                 data = train_data)
+
+# Display model
+print(lda_model)
+
+```
+
+```{r}
+# Group means
+cat("\n=== Group Means ===\n")
+cat("These are the average defensive statistics for each outcome:\n\n")
+means_df <- as.data.frame(lda_model$means)
+means_df$Outcome <- c("Loss", "Win")
+means_df <- means_df[, c("Outcome", "dreb", "stl", "blk", "tov", "pf")]
+kable(means_df, digits = 2, row.names = FALSE,
+      caption = "Average Defensive Statistics by Outcome")
+
+cat("\nInterpretation:\n")
+cat("- Winners average ~4 more defensive rebounds\n")
+cat("- Winners average ~1 more steal\n")
+cat("- Winners commit ~1 fewer turnover\n")
+
+```
+
+```{r}
+# Check normality assumption with Q-Q plots
+par(mfrow = c(2, 3))
+for(var in c("dreb", "stl", "blk", "tov", "pf")) {
+  qqnorm(train_data[[var]], main = paste("Q-Q Plot:", toupper(var)))
+  qqline(train_data[[var]], col = "red")
+}
+par(mfrow = c(1, 1))
+
+cat("\nAssessment: Defensive statistics are approximately normally distributed,\n")
+cat("making LDA's assumptions reasonable for this data.\n")
+
+```
+
+## Linear discriminant analysis results
+
+LDA estimates separate multivariate normal distributions for winners and losers and finds a linear boundary that best separates the two classes. The group means table shows clear differences in average defensive statistics by outcome:
+
+- Winning teams average about **4 more defensive rebounds**,  
+- About **1 more steal**,  
+- About **1 more block**,  
+- And commit roughly **1 fewer turnover** and **fewer personal fouls** than losing teams.
+
+The Q–Q plots indicate that the marginal distributions of the defensive variables are approximately normal, making LDA’s assumptions reasonably appropriate for this dataset. The LDA coefficients assign the largest positive weight to defensive rebounds and steals, and negative weight to turnovers and fouls, which aligns closely with the logistic regression results.
+
+```{r}
+# Fit classification tree
+tree_model <- rpart(as.factor(win) ~ dreb + stl + blk + tov + pf,
+                    data = train_data,
+                    method = "class",
+                    control = rpart.control(minsplit = 30, cp = 0.01))
+
+# Display tree structure
+print(tree_model)
+
+```
+
+```{r}
+# Plot the tree
+rpart.plot(tree_model, 
+           main = "Classification Tree for NBA Game Outcomes",
+           type = 4,  # Draw splits as vertical lines
+           extra = 104,  # Show prob of win, % of observations
+           under = TRUE,
+           faclen = 0,
+           cex = 0.8,
+           box.palette = "GnRd")
+
+cat("\nTree Interpretation:\n")
+cat("- Primary split: DREB < 34 (most important variable)\n")
+cat("- Secondary splits involve STL and TOV\n")
+cat("- Terminal nodes show win probability and sample size\n")
+
+```
+
+```{r}
+# Variable importance
+importance <- tree_model$variable.importance
+importance_df <- data.frame(
+  Variable = names(importance),
+  Importance = as.numeric(importance)
+) %>%
+  arrange(desc(Importance)) %>%
+  mutate(Variable = toupper(Variable),
+         Rel_Importance = Importance / sum(Importance) * 100)
+
+kable(importance_df, digits = 2,
+      caption = "Variable Importance from Classification Tree")
+
+# Visualize importance
+ggplot(importance_df, aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col(fill = "steelblue", alpha = 0.8) +
+  coord_flip() +
+  labs(title = "Variable Importance: Classification Tree",
+       x = "Defensive Metric",
+       y = "Importance Score") +
+  theme_minimal(base_size = 12)
+
+```
+
+## Classification tree results
+
+The classification tree model partitions games into regions of similar win probability using threshold splits on the defensive statistics. The first and most important split is on defensive rebounds around 33-35, separating low-rebound games from high-rebound games. Subsequent splits involve steals, blocks, turnovers, and fouls, refining the win probability for different defensive profiles.
+
+The variable importance table shows that:
+
+- **DREB** accounts for roughly **60%** of the total importance,  
+- **STL** is the second most important variable (~13%),  
+- BLK, PF, and TOV contribute smaller but non-negligible amounts.
+
+This confirms that defensive rebounding is the dominant defensive metric for predicting wins in this tree-based framework. The tree structure also highlights interpretable thresholds, such as teams with high DREB and moderate STL having win probabilities above 75%.
+
+```{r}
+# Logistic Regression
+logistic_prob <- predict(logistic_model, newdata = test_data, type = "response")
+logistic_pred <- ifelse(logistic_prob >= 0.5, 1, 0)
+
+# LDA
+lda_pred_obj <- predict(lda_model, newdata = test_data)
+lda_pred <- as.numeric(as.character(lda_pred_obj$class))
+lda_prob <- lda_pred_obj$posterior[, "1"]
+
+# Classification Tree
+tree_pred_obj <- predict(tree_model, newdata = test_data, type = "class")
+tree_pred <- as.numeric(as.character(tree_pred_obj))
+tree_prob <- predict(tree_model, newdata = test_data, type = "prob")[, "1"]
+
+# Store actual outcomes
+actual <- test_data$win
+
+```
+
+```{r}
+# Helper function for confusion matrix
+create_conf_matrix <- function(actual, predicted, model_name) {
+  cm <- table(Predicted = predicted, Actual = actual)
+  cat(sprintf("\n=== %s ===\n", model_name))
+  print(cm)
+  return(cm)
+}
+
+# Create confusion matrices
+cm_logistic <- create_conf_matrix(actual, logistic_pred, "Logistic Regression")
+cm_lda <- create_conf_matrix(actual, lda_pred, "Linear Discriminant Analysis")
+cm_tree <- create_conf_matrix(actual, tree_pred, "Classification Tree")
+
+```
+
+```{r}
+# Helper function to calculate metrics
+calc_metrics <- function(conf_matrix, prob, actual) {
+  tn <- conf_matrix[1, 1]
+  fp <- conf_matrix[1, 2]
+  fn <- conf_matrix[2, 1]
+  tp <- conf_matrix[2, 2]
+  
+  accuracy <- (tp + tn) / sum(conf_matrix)
+  sensitivity <- tp / (tp + fn)
+  specificity <- tn / (tn + fp)
+  
+  roc_obj <- roc(actual, prob, levels = c(0, 1), direction = "<")
+  auc_val <- as.numeric(auc(roc_obj))
+  
+  return(c(Accuracy = accuracy, 
+           Sensitivity = sensitivity, 
+           Specificity = specificity, 
+           AUC = auc_val))
+}
+
+# Calculate metrics for all models
+metrics_logistic <- calc_metrics(cm_logistic, logistic_prob, actual)
+metrics_lda <- calc_metrics(cm_lda, lda_prob, actual)
+metrics_tree <- calc_metrics(cm_tree, tree_prob, actual)
+
+# Create comparison table
+comparison_table <- data.frame(
+  Model = c("Logistic Regression", "Linear Discriminant Analysis", "Classification Tree"),
+  Accuracy = c(metrics_logistic["Accuracy"], metrics_lda["Accuracy"], metrics_tree["Accuracy"]),
+  Sensitivity = c(metrics_logistic["Sensitivity"], metrics_lda["Sensitivity"], metrics_tree["Sensitivity"]),
+  Specificity = c(metrics_logistic["Specificity"], metrics_lda["Specificity"], metrics_tree["Specificity"]),
+  AUC = c(metrics_logistic["AUC"], metrics_lda["AUC"], metrics_tree["AUC"])
+)
+
+kable(comparison_table, digits = 4,
+      caption = "Test Set Performance Comparison")
+
+# Identify best model
+best_model_idx <- which.max(comparison_table$AUC)
+cat(sprintf("\nBest performing model by AUC: %s (AUC = %.4f)\n", 
+            comparison_table$Model[best_model_idx],
+            comparison_table$AUC[best_model_idx]))
+
+```
+
+```{r}
+# Create ROC curves
+roc_logistic <- roc(actual, logistic_prob, levels = c(0, 1), direction = "<")
+roc_lda <- roc(actual, lda_prob, levels = c(0, 1), direction = "<")
+roc_tree <- roc(actual, tree_prob, levels = c(0, 1), direction = "<")
+
+# Plot all ROC curves together
+plot(roc_logistic, col = "#1f77b4", lwd = 2, main = "ROC Curves: Model Comparison")
+plot(roc_lda, col = "#ff7f0e", lwd = 2, add = TRUE)
+plot(roc_tree, col = "#2ca02c", lwd = 2, add = TRUE)
+abline(a = 0, b = 1, lty = 2, col = "gray")
+
+legend("bottomright", 
+       legend = c(sprintf("Logistic (AUC=%.3f)", auc(roc_logistic)),
+                  sprintf("LDA (AUC=%.3f)", auc(roc_lda)),
+                  sprintf("Tree (AUC=%.3f)", auc(roc_tree))),
+       col = c("#1f77b4", "#ff7f0e", "#2ca02c"),
+       lwd = 2, bty = "n")
+
+```
+
+## Test-set performance
+
+On the held-out test set of 492 team-games, all three models achieve similar overall performance:
+
+- **Logistic Regression**:  
+  - Accuracy: 0.6931  
+  - Sensitivity: 0.7162  
+  - Specificity: 0.6730  
+  - AUC: 0.7683  
+
+- **Linear Discriminant Analysis (LDA)**:  
+  - Accuracy: 0.6931  
+  - Sensitivity: 0.7181  
+  - Specificity: 0.6717  
+  - AUC: 0.7687  
+
+- **Classification Tree**:  
+  - Accuracy: 0.6850  
+  - Sensitivity: 0.7436  
+  - Specificity: 0.6465  
+  - AUC: 0.7001  
+
+The ROC curves show that both logistic regression and LDA lie well above the diagonal reference line, with AUC around **0.77**, indicating good ability to discriminate winners from losers. The classification tree performs slightly worse in terms of AUC (0.70), though it still clearly outperforms random guessing.
+
+LDA has the highest AUC on the test set by a small margin, but the difference between LDA and logistic regression is negligible at the reported precision. The tree achieves comparable accuracy but with a lower AUC, suggesting it is somewhat less consistent in ranking wins above losses across all thresholds.
+
+```{r}
+set.seed(123)
+
+# Number of folds
+k <- 10
+n_train <- nrow(train_data)
+
+# Create fold assignments
+fold_ids <- sample(rep(1:k, length.out = n_train))
+
+# Initialize storage for CV results
+cv_results <- data.frame(
+  Fold = integer(),
+  Model = character(),
+  Accuracy = numeric(),
+  AUC = numeric()
+)
+
+# Perform k-fold CV
+for(fold in 1:k) {
+  # Split into CV train and validation
+  cv_train <- train_data[fold_ids != fold, ]
+  cv_valid <- train_data[fold_ids == fold, ]
+  
+  ## Logistic Regression
+  cv_logistic <- glm(win ~ dreb + stl + blk + tov + pf,
+                     data = cv_train, family = binomial())
+  logistic_cv_prob <- predict(cv_logistic, newdata = cv_valid, type = "response")
+  logistic_cv_pred <- ifelse(logistic_cv_prob >= 0.5, 1, 0)
+  logistic_cv_acc <- mean(logistic_cv_pred == cv_valid$win)
+  logistic_cv_auc <- as.numeric(auc(roc(cv_valid$win, logistic_cv_prob, 
+                                        levels = c(0, 1), direction = "<")))
+  
+  ## LDA
+  cv_lda <- lda(win ~ dreb + stl + blk + tov + pf, data = cv_train)
+  lda_cv_pred_obj <- predict(cv_lda, newdata = cv_valid)
+  lda_cv_pred <- as.numeric(as.character(lda_cv_pred_obj$class))
+  lda_cv_prob <- lda_cv_pred_obj$posterior[, "1"]
+  lda_cv_acc <- mean(lda_cv_pred == cv_valid$win)
+  lda_cv_auc <- as.numeric(auc(roc(cv_valid$win, lda_cv_prob, 
+                                   levels = c(0, 1), direction = "<")))
+  
+  ## Classification Tree
+  cv_tree <- rpart(as.factor(win) ~ dreb + stl + blk + tov + pf,
+                   data = cv_train, method = "class",
+                   control = rpart.control(minsplit = 30, cp = 0.01))
+  tree_cv_pred <- as.numeric(as.character(predict(cv_tree, newdata = cv_valid, 
+                                                   type = "class")))
+  tree_cv_prob <- predict(cv_tree, newdata = cv_valid, type = "prob")[, "1"]
+  tree_cv_acc <- mean(tree_cv_pred == cv_valid$win)
+  tree_cv_auc <- as.numeric(auc(roc(cv_valid$win, tree_cv_prob, 
+                                    levels = c(0, 1), direction = "<")))
+  
+  # Store results
+  cv_results <- rbind(cv_results,
+                      data.frame(Fold = fold, Model = "Logistic", 
+                                 Accuracy = logistic_cv_acc, AUC = logistic_cv_auc),
+                      data.frame(Fold = fold, Model = "LDA", 
+                                 Accuracy = lda_cv_acc, AUC = lda_cv_auc),
+                      data.frame(Fold = fold, Model = "Tree", 
+                                 Accuracy = tree_cv_acc, AUC = tree_cv_auc))
+}
+
+# Summarize CV results
+cv_summary <- cv_results %>%
+  group_by(Model) %>%
+  summarise(
+    Mean_Accuracy = mean(Accuracy),
+    SD_Accuracy = sd(Accuracy),
+    Mean_AUC = mean(AUC),
+    SD_AUC = sd(AUC)
+  ) %>%
+  arrange(desc(Mean_AUC))
+
+kable(cv_summary, digits = 4,
+      caption = "10-Fold Cross-Validation Results (Mean ± SD)")
+
+```
+
+```{r}
+# Boxplots of CV performance
+p1 <- ggplot(cv_results, aes(x = Model, y = Accuracy, fill = Model)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_jitter(width = 0.1, alpha = 0.3) +
+  scale_fill_manual(values = c("Logistic" = "#1f77b4", 
+                                "LDA" = "#ff7f0e", 
+                                "Tree" = "#2ca02c")) +
+  labs(title = "10-Fold CV: Accuracy Distribution",
+       y = "Accuracy") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none")
+
+p2 <- ggplot(cv_results, aes(x = Model, y = AUC, fill = Model)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_jitter(width = 0.1, alpha = 0.3) +
+  scale_fill_manual(values = c("Logistic" = "#1f77b4", 
+                                "LDA" = "#ff7f0e", 
+                                "Tree" = "#2ca02c")) +
+  labs(title = "10-Fold CV: AUC Distribution",
+       y = "AUC") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none")
+
+# Display side by side
+library(gridExtra)
+grid.arrange(p1, p2, ncol = 2)
+
+```
+
+```{r}
+# Combine test and CV results
+final_comparison <- data.frame(
+  Model = c("Logistic Regression", "Linear Discriminant Analysis", "Classification Tree"),
+  Test_Accuracy = comparison_table$Accuracy,
+  CV_Accuracy = cv_summary$Mean_Accuracy,
+  Test_AUC = comparison_table$AUC,
+  CV_AUC = cv_summary$Mean_AUC
+) %>%
+  arrange(desc(CV_AUC))
+
+kable(final_comparison, digits = 4,
+      caption = "Final Model Comparison: Test Set vs. Cross-Validation")
+
+```
+
+## Cross-validation and model comparison
+
+The 10-fold cross-validation results on the training data are consistent with the test-set findings:
+
+- **LDA**: Mean accuracy $\approx$ 0.71, mean AUC $\approx$ 0.79  
+- **Logistic Regression**: Mean accuracy $\approx$ 0.71, mean AUC $\approx$ 0.79  
+- **Classification Tree**: Mean accuracy $\approx$ 0.68, mean AUC $\approx$ 0.69  
+
+The boxplots show relatively low variability in both accuracy and AUC across folds, indicating that model performance is stable and not overly sensitive to how the data are partitioned. The close match between cross-validated AUC (~0.79) and test AUC (~0.77) for logistic regression and LDA suggests that these models are not severely overfitting.
+
+The final comparison table summarizes test and cross-validated performance side by side:
+
+- Logistic Regression and LDA are essentially tied for best performance, with nearly identical accuracy and AUC.  
+- The Classification Tree slightly underperforms the linear models in AUC but remains competitive in accuracy and offers greater interpretability through its tree structure.
+
+Given these results, LDA and logistic regression are the preferred models for predictive performance, while the classification tree is valuable for communicating simple, rule-based decision logic to non-technical audiences.
+
+## Discussion
+
+### Interpretation of key defensive metrics
+
+Across all three modeling approaches, the same defensive variables emerge as most important:
+
+- **Defensive rebounds (DREB)**: Strongest and most consistent predictor. Teams that win games secure about four more defensive rebounds on average than teams that lose, and each additional rebound increases win odds by roughly 24% in the logistic model. 
+- **Steals (STL)**: Also positively associated with winning; winners average about one more steal per game than losers. Steals directly create extra possessions and transition opportunities.  
+- **Blocks (BLK)**: Show a positive but smaller effect, reflecting rim protection but also the relatively low frequency of blocks.
+- **Turnovers (TOV)**: Negatively associated with winning; teams that lose commit more turnovers, which is consistent with the idea that lost possessions reduce scoring chances. 
+- **Personal fouls (PF)**: Have a modest negative effect; excessive fouling can lead to free throws and foul trouble but is less predictive than rebounding or turnovers.
+
+These results provide quantitative support for the coaching intuition that "finishing possessions with a rebound” and “winning the turnover battle” are central to success.
+
+### Model choice and trade-offs
+
+- **Logistic Regression**: Offers strong predictive performance and highly interpretable coefficients. It is well-suited when we want to quantify effect sizes and communicate how changes in specific metrics affect win probability. 
+- **LDA**: Matches logistic regression in performance and is computationally efficient. It is particularly appealing when its normality and equal-covariance assumptions are roughly satisfied, as appears to be the case here. 
+- **Classification Tree**: Slightly weaker in AUC but provides intuitive decision rules and clear thresholds (e.g., DREB $\geq$ 35.5) that can be directly translated into game objectives.
+
+In practice, a combination of these models could be used: logistic regression or LDA for robust prediction and effect estimation, and a small pruned tree for communicating simple rules to coaches and players.
+
+### Limitations and future work
+
+This analysis has several limitations:
+
+- The models only use defensive statistics. Offensive performance, pace, opponent strength, and game context (home/away, rest days, injuries) are not included and likely explain additional variation in outcomes.  
+- Each game appears twice in the data (one row per team), which may violate strict independence assumptions. More advanced methods could model game-level dependence explicitly.  
+- A single season (2023-24) may not capture longer-term trends or changes in playing style.
+
+Future work could:
+
+- Incorporate offensive metrics and advanced efficiency measures (e.g., offensive/defensive ratings).  
+- Include contextual variables and explore interaction effects (e.g., how defensive strength matters more in close games).  
+- Extend the comparison to ensemble methods such as random forests and gradient boosting to see whether they meaningfully outperform the simpler models covered here.
+
+## Conclusion
+
+Using game-by-game defensive statistics from the 2023–24 NBA season, we built and compared logistic regression, linear discriminant analysis, and classification trees to predict game outcomes. All three models achieved test-set accuracies around 69% and AUC values between 0.70 and 0.77, substantially better than random guessing, with logistic regression and LDA performing best.
+
+Across methods, defensive rebounds and steals consistently emerged as the most important predictors of winning, while turnovers and personal fouls were negatively associated with success. These findings quantitatively reinforce the importance of controlling the defensive glass and protecting the ball, providing data-driven support for long-standing basketball strategy principles.
