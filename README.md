@@ -2,8 +2,9 @@
 
 Overview:
 
-This project analyzes how common defensive actions relate to winning single NBA games. Using team‑game box scores from the 2023–24 season, it models win probability from five familiar stats: defensive rebounds, steals, blocks, turnovers, and personal fouls. The work emphasizes clarity and validation, pairing simple, interpretable models with out‑of‑sample checks and coach‑friendly visuals.
+This R project models NBA win probabilities using defensive stats from 1,230 team-games in the 2023-24 season. It compares Logistic Regression, LDA, and Classification Trees via 80/20 splits and 10-fold CV, achieving AUC 0.79 with low variance.
+​
 
-Key findings:
+Key Findings:
 
-Defensive rebounds and steals are strongly associated with higher chances of winning, blocks help modestly, and turnovers and fouls are associated with lower chances of winning. The model’s probabilities are well calibrated and rank games effectively by win likelihood, supporting practical use in scouting, lineup decisions, and practice priorities.
+Each defensive rebound boosts win odds by 24%; steals help strongly while fouls hurt. Well-calibrated probabilities aid scouting and strategy.
